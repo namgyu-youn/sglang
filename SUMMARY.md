@@ -1,7 +1,9 @@
 # 결과 요약 — PD per-layer KV send 프로토타입 (PR #23515 리뷰 지원)
 
-브랜치 `pd-layer-event-send-prototype` (base `67361ff91b`), 커밋 3개, 총 ~215줄
-(cctry 추정 <150줄 근접).
+브랜치 `pd-layer-event-send-prototype` (base `67361ff91b`), 프로토타입 코드
+~215줄 (cctry 추정 <150줄 근접) + 검증/벤치마크 커밋 2개.
+게시 위치: https://github.com/namgyu-youn/sglang/tree/pd-layer-event-send-prototype
+(포크에만 푸시, PR 없음).
 
 ## 문서 지도
 
@@ -136,4 +138,9 @@ backend, `--disable-radix-cache`(cache-hit 버그 회피) + `--chunked-prefill-s
 
 ## 하지 않은 것
 
-- GitHub에 아무것도 안 올림. #23515 모델 파일 안 건드림. 성능 우위 주장 없음.
+- PR/이슈/리뷰 코멘트 게시 없음 — 브랜치를 개인 포크에만 푸시함 (2026-07-05).
+- #23515 모델 파일 안 건드림.
+- 공개적인 성능 우위 주장 없음 — 위 벤치마크 결과는 이 문서에만 기록됨.
+  loopback TCP 조건이므로 RDMA 환경 재측정 전에는 리뷰 스레드에 수치로 인용할 때
+  주의 필요. radix-cache-hit 정확성 버그가 미해결인 상태에서는 어떤 성능 주장도
+  조건부("cache-miss 한정")임을 명시해야 함.
