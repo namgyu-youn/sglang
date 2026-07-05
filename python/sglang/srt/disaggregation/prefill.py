@@ -24,7 +24,7 @@ import logging
 from array import array
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -48,6 +48,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     setup_state_kv_args,
 )
+from sglang.srt.disaggregation.layer_event_send import LayerEventSendCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -62,6 +63,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
@@ -399,6 +401,106 @@ class SchedulerDisaggregationPrefillMixin:
     Mixin for Scheduler to handle disaggregation prefill
     """
 
+    # Prototype (PR #23515 review): per-layer event-driven KV send state.
+    # Class-level defaults so Scheduler.__init__ stays untouched.
+    _layer_event_send_coordinator: Optional[LayerEventSendCoordinator] = None
+    _layer_event_armed_reqs: Tuple = ()
+
+    def maybe_begin_layer_event_send(self: Scheduler, batch: ScheduleBatch) -> bool:
+        """Arm per-layer event-driven KV send for this prefill forward.
+
+        Prototype for the PR #23515 review discussion: the transport
+        (send_layer / send_kvcache_layer) is #23515's, but the producer is the
+        normal run_batch forward — KVCache.set_kv_buffer fires a per-layer
+        notifier that records a LayerDoneCounter event on the compute stream
+        and enqueues that layer's RDMA send. No split-prefill scheduler path,
+        no per-model changes.
+        """
+        if not envs.SGLANG_ENABLE_LAYER_EVENT_KV_TRANSFER.get():
+            return False
+        if self.transfer_backend not in (
+            TransferBackend.MOONCAKE,
+            TransferBackend.FAKE,
+        ):
+            return False
+        # send_kvcache_layer indexes kv_data_ptrs with global layer ids,
+        # incompatible with PP's per-stage pointer slicing; the per-layer path
+        # also bypasses staging gather/scatter.
+        if self.ps.pp_size > 1 or self.enable_staging:
+            return False
+        # Draft-model KV layers are not covered by the target pool's notifier.
+        if not self.spec_algorithm.is_none():
+            return False
+        kv_args = self.disagg_prefill_bootstrap_queue.kv_manager.kv_args
+        # Hybrid extra state (Mamba/SWA/DSA/...) does not flow through
+        # set_kv_buffer; keep those models on the normal chunk path.
+        if kv_args.state_types:
+            return False
+        # Compressed MLA uses a bucketed pointer layout that the per-layer
+        # transport does not handle.
+        if kv_args.mla_compression_ratios:
+            return False
+        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        # Only pools whose write path is known to fire the notifier; an
+        # overriding subclass (FP4, NoOp, ...) would silently skip layers and
+        # leave the decode side waiting.
+        if type(kvcache).set_kv_buffer not in (
+            MHATokenToKVPool.set_kv_buffer,
+            MLATokenToKVPool.set_kv_buffer,
+        ):
+            return False
+
+        page_size = self.token_to_kv_pool_allocator.page_size
+        plan = []
+        armed = []
+        for req in batch.reqs:
+            # Mirror #23515's launch-time eligibility: only requests whose
+            # prefill completes in this batch send per-layer; middle chunks
+            # keep the normal chunk path so sender curr_idx bookkeeping stays
+            # identical to send_kv_chunk's.
+            if req.pending_bootstrap or req.inflight_middle_chunks > 0:
+                continue
+            end_idx = min(req.extend_range.end, len(req.origin_input_ids))
+            if end_idx <= req.start_send_idx:
+                continue
+            kv_indices = (
+                self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, req.start_send_idx : end_idx
+                ]
+                .cpu()
+                .numpy()
+            )
+            page_indices = kv_to_page_indices(kv_indices, page_size)
+            if len(page_indices) == 0:
+                continue
+            plan.append((req.disagg_kv_sender, page_indices))
+            armed.append((req, end_idx))
+        if not plan:
+            return False
+
+        if self._layer_event_send_coordinator is None:
+            self._layer_event_send_coordinator = LayerEventSendCoordinator(
+                kvcache.layer_num
+            )
+        self._layer_event_send_coordinator.begin_batch(plan)
+        kvcache.register_layer_send_notifier(
+            self._layer_event_send_coordinator.on_layer_written
+        )
+        self._layer_event_armed_reqs = tuple(armed)
+        return True
+
+    def end_layer_event_send(self: Scheduler) -> None:
+        """Disarm the per-layer notifier after run_batch returns and mark armed
+        requests so process_batch_result sends only the final metadata."""
+        self.token_to_kv_pool_allocator.get_kvcache().register_layer_send_notifier(
+            None
+        )
+        self._layer_event_send_coordinator.end_batch()
+        for req, end_idx in self._layer_event_armed_reqs:
+            req.pipelined_kv_sent = True
+            req.start_send_idx = end_idx
+        self._layer_event_armed_reqs = ()
+
     def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
         kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
@@ -488,7 +590,10 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
+                layer_send_armed = self.maybe_begin_layer_event_send(batch)
                 result = self.run_batch(batch)
+                if layer_send_armed:
+                    self.end_layer_event_send()
                 self.process_batch_result(batch, result)
             else:
                 self.on_idle()
@@ -654,7 +759,15 @@ class SchedulerDisaggregationPrefillMixin:
                         logits_output,
                     )
                     logprob_pt += num_input_logprobs
-                self.send_kv_chunk(req, last_chunk=True)
+                if req.pipelined_kv_sent:
+                    # KV data was already enqueued per layer during the forward.
+                    # Write metadata first, then enqueue the final
+                    # metadata/status transfer so the transfer worker cannot
+                    # race ahead and send stale aux buffers.
+                    self.disagg_metadata_buffers.set_buf(req)
+                    req.disagg_kv_sender.send_final_metadata()
+                else:
+                    self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 
                 if req.grammar is not None:

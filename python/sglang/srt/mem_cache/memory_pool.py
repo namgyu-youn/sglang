@@ -27,7 +27,7 @@ import dataclasses
 import logging
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -1224,6 +1224,10 @@ class KVCache(abc.ABC):
         # default state for optional layer-wise transfer control
         self.layer_transfer_counter = None
 
+        # optional per-layer KV-write notifier for PD layer-pipelined send
+        # (prototype for PR #23515 review; armed only around disagg prefill forwards)
+        self.layer_send_notifier = None
+
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
             maybe_init_custom_mem_pool(device=self.device)
@@ -1273,6 +1277,13 @@ class KVCache(abc.ABC):
 
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
+
+    def register_layer_send_notifier(self, notifier: Optional[Callable[[int], None]]):
+        self.layer_send_notifier = notifier
+
+    def _notify_layer_send(self, layer_id: int):
+        if self.layer_send_notifier is not None:
+            self.layer_send_notifier(layer_id - self.start_layer)
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         raise NotImplementedError()
@@ -1715,9 +1726,7 @@ class MHATokenToKVPool(KVCache):
                 cache_v.stride(0),
                 cache_v.stride(1),
             )
-            return
-
-        if self.use_hnd:
+        elif self.use_hnd:
             # A slot is [page, :, off, :] (not a contiguous row), so scatter by (page, off).
             k_buf = self.k_buffer[layer_id - self.start_layer]
             v_buf = self.v_buffer[layer_id - self.start_layer]
@@ -1725,9 +1734,9 @@ class MHATokenToKVPool(KVCache):
             offs = loc % self.page_size
             k_buf[pages, :, offs, :] = cache_k
             v_buf[pages, :, offs, :] = cache_v
-            return
-
-        self._store_kv_layer(layer_id - self.start_layer, loc, cache_k, cache_v)
+        else:
+            self._store_kv_layer(layer_id - self.start_layer, loc, cache_k, cache_v)
+        self._notify_layer_send(layer_id)
 
     def _store_kv_layer(
         self,
@@ -2744,6 +2753,7 @@ class MLATokenToKVPool(KVCache):
             )
         else:
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
+        self._notify_layer_send(layer_id)
 
     def set_mla_kv_buffer(
         self,
@@ -2796,6 +2806,7 @@ class MLATokenToKVPool(KVCache):
                 cache_k_nope,
                 cache_k_rope,
             )
+        self._notify_layer_send(layer_id)
 
     def get_mla_kv_buffer(
         self,

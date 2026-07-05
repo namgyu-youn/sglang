@@ -360,6 +360,10 @@ class Envs:
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
+    # Prototype (PR #23515 review): per-layer KV send driven by LayerDoneCounter
+    # events recorded on the prefill compute stream, instead of #23515's
+    # run_batch_pipelined scheduler path.
+    SGLANG_ENABLE_LAYER_EVENT_KV_TRANSFER = EnvBool(False)
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.

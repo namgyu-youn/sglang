@@ -999,6 +999,11 @@ class Req(ReqDllmMixin):
         # start_send_idx = req.extend_range.end
         self.start_send_idx: int = 0
 
+        # Prototype (PR #23515 review): set when this request's KV data was
+        # already enqueued per layer during the forward, so the last-chunk
+        # path only sends the final metadata/status transfer.
+        self.pipelined_kv_sent: bool = False
+
         # For overlap schedule, we delay the kv transfer until `process_batch_result_disagg_prefill` rather than `process_prefill_chunk` in non-overlap
         # This is because kv is not ready in `process_prefill_chunk`.
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
