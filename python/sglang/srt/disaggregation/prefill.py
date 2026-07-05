@@ -487,6 +487,9 @@ class SchedulerDisaggregationPrefillMixin:
             self._layer_event_send_coordinator.on_layer_written
         )
         self._layer_event_armed_reqs = tuple(armed)
+        logger.info(
+            "Layer-event KV send armed: %d reqs, %d layers", len(plan), kvcache.layer_num
+        )
         return True
 
     def end_layer_event_send(self: Scheduler) -> None:
