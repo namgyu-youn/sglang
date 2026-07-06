@@ -84,19 +84,10 @@ libnuma1`, `CUDA_HOME=<venv>/nvidia/cu13`(+ `lib64`/`libcudart.so` 심링크),
 ## 미해결
 
 - **radix-cache-hit 정확성 버그**: cached prefix 있는 요청의 KV가 잘못 전송됨
-  (temperature 0, 100% 재현). **루트코즈 확정, 코드 리뷰 레벨에서 수정 완료
-  (`py_compile` 통과), GPU e2e 재검증 미완료.** 원인: `maybe_begin_layer_event_send`
-  (arm)가 `run_batch` 이전에 실행되는데, `run_batch`가 내부에서 첫 단계로 호출하는
-  `maybe_send_cached_prefix_chunk` (device-resident 캐시 prefix 조기 전송,
-  `SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX` 기본 True)가 `req.start_send_idx`와
-  sender의 `curr_idx`를 그보다 나중에 전진시킴 — arm 시점엔 아직 전진 전이라 이미
-  조기 전송된 캐시 prefix 페이지가 per-layer plan에 중복 포함되고, 그 뒤 `send_layer`가
-  이미 전진한 `curr_idx` 기준으로 목적지 오프셋을 계산해 밀린 위치에 데이터가 씀.
-  수정: arm 루프 안에서 `req.start_send_idx`를 읽기 전에 `maybe_send_cached_prefix_chunk`를
-  먼저 호출 (두 번 호출돼도 안전 — 함수 자체가 `cached_end <= start_send_idx`로 가드).
-  기존 CPU 유닛 테스트는 `prefill.py`를 커버하지 않아 이 수정을 검증하지 못함 — GPU
-  2노드 환경에서 flag=1/0 diff 재실행 필요. 해결 전엔 성능 주장은 "cache-miss 한정"
-  조건부.
+  (temperature 0, 100% 재현). 루트코즈 확정, 코드 레벨 수정 적용 완료
+  (`py_compile` 통과). 기존 CPU 유닛 테스트는 이 코드 경로를 커버하지 않아 검증
+  불가 — GPU 2노드 환경에서 flag=1/0 diff 재실행 필요. 해결 전엔 성능 주장은
+  "cache-miss 한정" 조건부.
 - overlap 스케줄러 미지원 (기본값에서 플래그 무시됨) — coordinator의 slot-rotation
   안전성이 non-overlap 동기화에 의존, 설계 재검토 필요.
 - 하이브리드(Mamba/SWA/DSA) 상태는 `set_kv_buffer`를 안 지나감 — 미구현.
