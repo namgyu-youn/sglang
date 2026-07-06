@@ -460,6 +460,10 @@ class SchedulerDisaggregationPrefillMixin:
             # identical to send_kv_chunk's.
             if req.pending_bootstrap or req.inflight_middle_chunks > 0:
                 continue
+            # Must run before we read start_send_idx below: run_batch() also
+            # calls this, but only after us, which is too late for a
+            # cache-hit request's device-resident prefix.
+            self.maybe_send_cached_prefix_chunk(req)
             end_idx = min(req.extend_range.end, len(req.origin_input_ids))
             if end_idx <= req.start_send_idx:
                 continue
